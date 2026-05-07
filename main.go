@@ -15,38 +15,54 @@ import (
 */
 import "C"
 
-func mqttConnect() {
-	opts := mqtt.NewClientOptions().AddBroker("127.0.0.1:1883")
-	opts.ConnectTimeout = time.Second
-	opts.SetConnectionNotificationHandler(func(client mqtt.Client, notification mqtt.ConnectionNotification) {
-		fmt.Printf("\t[mqtt connection notification] %v\n", notification)
-	})
-	cli := mqtt.NewClient(opts)
-	if tkn := cli.Connect(); tkn.Wait() && tkn.Error() != nil {
-		os.Exit(1)
-	}
-	if tkn := cli.Subscribe("gateway/control/#", 0, mqttCmdHandler); tkn.Wait() && tkn.Error() != nil {
-		os.Exit(2)
-	}
+type ThermalGatewayService struct {
+	mqttClient mqtt.Client
+	signals    chan os.Signal
 }
 
-func mqttCmdHandler(c mqtt.Client, msg mqtt.Message) {
+func (s *ThermalGatewayService) AttachSignals() {
+	s.signals = make(chan os.Signal, 1)
+	signal.Notify(s.signals, syscall.SIGTERM, syscall.SIGINT)
+}
+
+func (s *ThermalGatewayService) InitMQ() {
+	opts := mqtt.NewClientOptions().
+		AddBroker(getEnvWithDefault("MQTT_BROKER", "127.0.0.1:1883")).
+		SetClientID(getEnvWithDefault("MQTT_CLIENT_ID", "thermal-gateway")).
+		SetConnectTimeout(time.Second).
+		SetConnectRetry(true).
+		SetConnectRetryInterval(3 * time.Second).
+		SetKeepAlive(1).
+		SetConnectionNotificationHandler(s.mqttConnStatus)
+
+	s.mqttClient = mqtt.NewClient(opts)
+
+	s.mqttClient.Connect()
+}
+
+func (s *ThermalGatewayService) cmdHandler(c mqtt.Client, msg mqtt.Message) {
 	fmt.Println("cmd:", string(msg.Payload()))
+
 }
 
-func main() {
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
-	ticks := time.Tick(3 * time.Second)
+func (s *ThermalGatewayService) mqttConnStatus(client mqtt.Client, notification mqtt.ConnectionNotification) {
+	fmt.Printf("\t[mqtt connection notification] %v\n", notification)
+	if notification.Type() == mqtt.ConnectionNotificationTypeConnected {
+		if tkn := s.mqttClient.Subscribe("gateway/control/#", 0, s.cmdHandler); tkn.Wait() && tkn.Error() != nil {
+			os.Exit(2)
+		}
+	}
+}
 
-	mqttConnect()
+func (s *ThermalGatewayService) Run() {
+	ticks := time.Tick(3 * time.Second)
 
 	println("waiting for SIGTERM or SIGINT, just printing time and temperature sometimes")
 
 mainLoop:
 	for {
 		select {
-		case sig := <-signals:
+		case sig := <-s.signals:
 			println("signal received:", sig.String())
 			break mainLoop
 		case <-ticks:
@@ -55,4 +71,18 @@ mainLoop:
 		}
 	}
 	println("exiting")
+}
+
+func getEnvWithDefault(name, defaultValue string) string {
+	if val, ok := os.LookupEnv(name); ok {
+		return val
+	}
+	return defaultValue
+}
+
+func main() {
+	svc := &ThermalGatewayService{}
+	svc.AttachSignals()
+	svc.InitMQ()
+	svc.Run()
 }
