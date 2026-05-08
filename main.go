@@ -80,7 +80,7 @@ func (s *ThermalGatewayService) cmdHandler(c mqtt.Client, msg mqtt.Message) {
 func (s *ThermalGatewayService) sendSingleSensor(id int) {
 	temp := int(C.get_temperature_celsius(C.int(id)))
 	bytes, _ := json.Marshal(sensorReport(id, temp))
-	s.publishAndMonitor(dataTopicName, bytes)
+	go s.publishAndMonitor(dataTopicName, bytes)
 }
 
 func (s *ThermalGatewayService) sendBatchSensors(num int) {
