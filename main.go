@@ -114,13 +114,16 @@ func sensorReport(id, value int) map[string]any {
 	return res
 }
 
-func (s *ThermalGatewayService) mqttConnStatus(client mqtt.Client, notification mqtt.ConnectionNotification) {
+func (s *ThermalGatewayService) mqttConnStatus(
+	client mqtt.Client, notification mqtt.ConnectionNotification) {
 	switch notification.Type() {
 	case mqtt.ConnectionNotificationTypeConnected:
 		slog.Info("mqtt connected")
 		s.connected = true
-		if tkn := s.mqttClient.Subscribe(cmdTopicPattern, 0, s.cmdHandler); tkn.Wait() && tkn.Error() != nil {
-			slog.Error("mqtt subscription failed, this needs investigation (so quit now):", tkn.Error())
+		tkn := s.mqttClient.Subscribe(cmdTopicPattern, 0, s.cmdHandler)
+		tkn.WaitTimeout(3 * time.Second)
+		if tkn.Error() != nil {
+			slog.Error("mqtt subscription failed, so quit now:", tkn.Error())
 			os.Exit(1)
 		}
 	case mqtt.ConnectionNotificationTypeFailed:
@@ -140,8 +143,11 @@ mainLoop:
 		select {
 		case sig := <-s.signals:
 			slog.Warn("signal received:", "type", sig.String())
-			break mainLoop
-		case readSensorId := <-s.readCmds:
+			close(s.readCmds)
+		case readSensorId, ok := <-s.readCmds:
+			if !ok {
+				break mainLoop
+			}
 			s.sendSingleSensor(readSensorId)
 		case <-pollTicks:
 			s.sendBatchSensors(s.options.batchSize)
