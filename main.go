@@ -27,6 +27,8 @@ const (
 type ThermalGatewayService struct {
 	options    tgsOptions
 	mqttClient mqtt.Client
+	connected  bool
+	readCmds   chan int
 	signals    chan os.Signal
 }
 
@@ -34,6 +36,7 @@ type tgsOptions struct {
 	mqttBroker         string
 	clientId           string
 	sensorReadInterval int
+	batchSize          int
 }
 
 func (s *ThermalGatewayService) AttachSignals() {
@@ -50,6 +53,8 @@ func (s *ThermalGatewayService) InitMQ() {
 		SetConnectRetryInterval(3 * time.Second).
 		SetKeepAlive(1).
 		SetConnectionNotificationHandler(s.mqttConnStatus)
+
+	s.readCmds = make(chan int, 256)
 	s.mqttClient = mqtt.NewClient(opts)
 	s.mqttClient.Connect()
 }
@@ -69,7 +74,7 @@ func (s *ThermalGatewayService) cmdHandler(c mqtt.Client, msg mqtt.Message) {
 		return
 	}
 	slog.Debug("command 'read' received:", "sensor", cmd.Sensor_id)
-	s.sendSingleSensor(cmd.Sensor_id)
+	s.readCmds <- cmd.Sensor_id
 }
 
 func (s *ThermalGatewayService) sendSingleSensor(id int) {
@@ -90,7 +95,7 @@ func (s *ThermalGatewayService) sendBatchSensors(num int) {
 }
 
 func (s *ThermalGatewayService) publishAndMonitor(topic string, data []byte) {
-	if !s.mqttClient.IsConnected() {
+	if !s.connected {
 		slog.Info("publish skipped as mqtt currently not connected", "topic", topic)
 		return
 	}
@@ -113,32 +118,37 @@ func (s *ThermalGatewayService) mqttConnStatus(client mqtt.Client, notification 
 	switch notification.Type() {
 	case mqtt.ConnectionNotificationTypeConnected:
 		slog.Info("mqtt connected")
+		s.connected = true
 		if tkn := s.mqttClient.Subscribe(cmdTopicPattern, 0, s.cmdHandler); tkn.Wait() && tkn.Error() != nil {
 			slog.Error("mqtt subscription failed, this needs investigation (so quit now):", tkn.Error())
 			os.Exit(1)
 		}
 	case mqtt.ConnectionNotificationTypeFailed:
 		slog.Info("mqtt connection failed (will retry)")
+		s.connected = false
 	case mqtt.ConnectionNotificationTypeLost:
 		slog.Info("mqtt connection lost (will try to reconnect)")
+		s.connected = false
 	}
 }
 
 func (s *ThermalGatewayService) Run() {
 	pollTicks := time.Tick(time.Duration(s.options.sensorReadInterval) * time.Second)
-
 	slog.Warn("everything is all right, entering main processing loop until SIGTERM or SIGINT")
-
 mainLoop:
 	for {
 		select {
 		case sig := <-s.signals:
 			slog.Warn("signal received:", "type", sig.String())
 			break mainLoop
+		case readSensorId := <-s.readCmds:
+			s.sendSingleSensor(readSensorId)
 		case <-pollTicks:
-			s.sendBatchSensors(5)
+			s.sendBatchSensors(s.options.batchSize)
 		}
 	}
+	slog.Info("disconnecting mqtt")
+	s.mqttClient.Disconnect(300)
 	slog.Warn("exiting, bye")
 }
 
@@ -146,15 +156,20 @@ func (s *ThermalGatewayService) ConfigureFromEnv() {
 	s.options = tgsOptions{
 		mqttBroker:         getEnvWithDefault("MQTT_BROKER", "tcp://127.0.0.1:1883"),
 		clientId:           getEnvWithDefault("MQTT_CLIENT_ID", "thermal-service"),
-		sensorReadInterval: 30,
-	}
-	if sec, err := strconv.Atoi(os.Getenv("POLL_INTERVAL_SEC")); err == nil {
-		s.options.sensorReadInterval = sec
+		sensorReadInterval: getEnvWithDefaultAsInt("POLL_INTERVAL_SEC", 30),
+		batchSize:          getEnvWithDefaultAsInt("POLL_BATCH_SIZE", 5),
 	}
 }
 
 func getEnvWithDefault(name, defaultValue string) string {
 	if val, ok := os.LookupEnv(name); ok {
+		return val
+	}
+	return defaultValue
+}
+
+func getEnvWithDefaultAsInt(name string, defaultValue int) int {
+	if val, err := strconv.Atoi(os.Getenv(name)); err == nil {
 		return val
 	}
 	return defaultValue
